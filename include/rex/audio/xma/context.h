@@ -306,6 +306,9 @@ class XmaContext {
   bool carry_valid_ = false;
   uint8_t pending_output_limit_ = 0;
   uint8_t pending_start_skip_ = 0;
+
+  // True once this logical stream has seen input; see xma_wait_for_input.
+  bool stream_started_ = false;
 };
 
 }  // namespace rex::audio

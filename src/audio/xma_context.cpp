@@ -15,6 +15,7 @@
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/memory/ring_buffer.h>
@@ -32,6 +33,12 @@ extern "C" {
 #pragma warning(pop)
 #endif
 }  // extern "C"
+
+REXCVAR_DEFINE_BOOL(xma_wait_for_input, true, "Audio",
+                    "Do not touch a freshly set output buffer until the stream's first input "
+                    "buffer arrives. Games set the output buffer before the input; marking it "
+                    "done (output_buffer_valid = 0) in between made them play the never-written "
+                    "buffer (0xCDCD fill) as a 50 ms DC pop at the start of every sound.");
 
 // Credits for most of this code goes to:
 // https://github.com/koolkdev/libertyv/blob/master/libav_wrapper/xma2dec.c
@@ -105,6 +112,16 @@ bool XmaContext::Work() {
   const XMA_CONTEXT_DATA initial_data = data;
 
   if (!data.output_buffer_valid) {
+    return true;
+  }
+
+  // Stream start: the guest sets the output buffer before the input buffers.
+  // With nothing to decode yet, leave the context untouched instead of letting
+  // the empty-ring check below report the output buffer as done.
+  if (data.IsAnyInputBufferValid()) {
+    stream_started_ = true;
+  } else if (REXCVAR_GET(xma_wait_for_input) && !stream_started_ &&
+             !current_frame_remaining_subframes_) {
     return true;
   }
 
@@ -200,6 +217,7 @@ void XmaContext::ResetDecoderState() {
     av_context_->sample_rate = 0;
     av_context_->channels = 0;
   }
+  stream_started_ = false;
   raw_frame_.fill(0);
   decoded_frame_.fill(0);
   carry_frame_.fill(0);

@@ -1947,6 +1947,13 @@ void VulkanCommandProcessor::ShutdownContext() {
     }
   }
   memexport_readback_buffers_.clear();
+  if (memexport_full_mapping_ && memexport_full_memory_ != VK_NULL_HANDLE) {
+    dfn.vkUnmapMemory(device, memexport_full_memory_);
+  }
+  memexport_full_mapping_ = nullptr;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, memexport_full_buffer_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, memexport_full_memory_);
+  memexport_full_size_ = 0;
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -4204,16 +4211,41 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
-  VkBuffer readback_buffer = VK_NULL_HANDLE;
-  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
-  uint32_t readback_memory_type = UINT32_MAX;
-  VkDeviceSize readback_memory_size = 0;
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          vulkan_device, total_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory,
-          &readback_memory_type, &readback_memory_size)) {
-    REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
-    return true;
+  // Bufer reutilizable: solo se recrea si hace falta mas espacio. Antes se hacia
+  // vkAllocateMemory + vkFreeMemory en cada dibujo con memexport.
+  if (memexport_full_buffer_ == VK_NULL_HANDLE || total_size > memexport_full_size_) {
+    if (memexport_full_buffer_ != VK_NULL_HANDLE) {
+      if (!AwaitAllQueueOperationsCompletion()) {
+        return true;
+      }
+      if (memexport_full_mapping_) {
+        dfn.vkUnmapMemory(device, memexport_full_memory_);
+      }
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, memexport_full_buffer_);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, memexport_full_memory_);
+      memexport_full_mapping_ = nullptr;
+      memexport_full_size_ = 0;
+    }
+    const uint32_t new_size = AlignReadbackBufferSize(total_size);
+    VkDeviceSize allocated_size = 0;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, new_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            ui::vulkan::util::MemoryPurpose::kReadback, memexport_full_buffer_,
+            memexport_full_memory_, &memexport_full_memory_type_, &allocated_size)) {
+      REXGPU_ERROR("Failed to create a Vulkan memexport readback buffer");
+      memexport_full_buffer_ = VK_NULL_HANDLE;
+      memexport_full_memory_ = VK_NULL_HANDLE;
+      return true;
+    }
+    if (dfn.vkMapMemory(device, memexport_full_memory_, 0, VK_WHOLE_SIZE, 0,
+                        &memexport_full_mapping_) != VK_SUCCESS) {
+      REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, memexport_full_buffer_);
+      ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, memexport_full_memory_);
+      memexport_full_mapping_ = nullptr;
+      return true;
+    }
+    memexport_full_size_ = new_size;
   }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
@@ -4225,50 +4257,35 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
     readback_region.srcOffset = memexport_range.base_address_dwords << 2;
     readback_region.dstOffset = readback_offset;
     readback_region.size = memexport_range.size_bytes;
-    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
+    deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), memexport_full_buffer_, 1,
                                              &readback_region);
     readback_offset += memexport_range.size_bytes;
   }
-  PushBufferMemoryBarrier(readback_buffer, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  PushBufferMemoryBarrier(memexport_full_buffer_, 0, total_size, VK_PIPELINE_STAGE_TRANSFER_BIT,
                           VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                           VK_ACCESS_HOST_READ_BIT);
 
   if (!AwaitAllQueueOperationsCompletion()) {
     REXGPU_ERROR("Failed to await completion of Vulkan memexport readback");
-    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-    dfn.vkFreeMemory(device, readback_memory, nullptr);
     return true;
   }
 
-  void* readback_mapping = nullptr;
-  if (dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &readback_mapping) !=
-      VK_SUCCESS) {
-    REXGPU_ERROR("Failed to map a Vulkan memexport readback buffer");
-    dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-    dfn.vkFreeMemory(device, readback_memory, nullptr);
-    return true;
-  }
-
-  if (!(vulkan_device->memory_types().host_coherent & (uint32_t(1) << readback_memory_type))) {
+  if (!(vulkan_device->memory_types().host_coherent &
+        (uint32_t(1) << memexport_full_memory_type_))) {
     VkMappedMemoryRange readback_memory_range = {};
     readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    readback_memory_range.memory = readback_memory;
+    readback_memory_range.memory = memexport_full_memory_;
     readback_memory_range.offset = 0;
-    readback_memory_range.size = std::min(
-        rex::round_up(VkDeviceSize(total_size), vulkan_device->properties().nonCoherentAtomSize),
-        readback_memory_size);
+    readback_memory_range.size = VK_WHOLE_SIZE;
     dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
   }
 
-  const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(readback_mapping);
+  const uint8_t* readback_bytes = reinterpret_cast<const uint8_t*>(memexport_full_mapping_);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
     std::memcpy(memory_->TranslatePhysical(memexport_range.base_address_dwords << 2),
                 readback_bytes, memexport_range.size_bytes);
     readback_bytes += memexport_range.size_bytes;
   }
-  dfn.vkUnmapMemory(device, readback_memory);
-  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
-  dfn.vkFreeMemory(device, readback_memory, nullptr);
   return true;
 }
 

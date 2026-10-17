@@ -749,6 +749,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+  // Bufer reutilizable para la lectura completa de memexport (antes se creaba y
+  // destruia una asignacion de memoria en cada dibujo con memexport).
+  VkBuffer memexport_full_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory memexport_full_memory_ = VK_NULL_HANDLE;
+  void* memexport_full_mapping_ = nullptr;
+  VkDeviceSize memexport_full_size_ = 0;
+  uint32_t memexport_full_memory_type_ = UINT32_MAX;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

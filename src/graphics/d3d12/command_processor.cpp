@@ -1648,6 +1648,12 @@ void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  if (gpu_tiempos_readback_ && gpu_tiempos_map_) {
+    gpu_tiempos_readback_->Unmap(0, nullptr);
+  }
+  gpu_tiempos_map_ = nullptr;
+  gpu_tiempos_readback_.Reset();
+  gpu_tiempos_heap_.Reset();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
@@ -1928,6 +1934,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
     return;
   }
+  GpuMarca(gpu_tiempos::kSwapIni);
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
@@ -2896,12 +2903,17 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  GpuMarca(gpu_tiempos::kResolveIni);
+  bool resolve_ok;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    resolve_ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                               written_address, written_length);
+  } else {
+    resolve_ok = IssueCopy_ReadbackResolvePath();
   }
-  return IssueCopy_ReadbackResolvePath();
+  GpuMarca(gpu_tiempos::kResolveFin);
+  return resolve_ok;
 }
 
 namespace {
@@ -2980,6 +2992,87 @@ ReadbackResolveMode D3D12CommandProcessor::ReadbackResolveModeFor(ReadbackResolv
   if (others == "fast") return ReadbackResolveMode::kFast;
   if (others == "some") return ReadbackResolveMode::kSome;
   return ReadbackResolveMode::kDisabled;
+}
+
+// gpu_tiempos: ver include/rex/graphics/util/gpu_tiempos.h.
+void D3D12CommandProcessor::GpuTiemposInicioCuadro() {
+  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
+  gpu_tiempos::Cuadro& cuadro = gpu_tiempos_cuadros_[slot];
+  if (!REXCVAR_GET(gpu_tiempos)) {
+    cuadro.n = 0;
+    return;
+  }
+  if (!gpu_tiempos_heap_) {
+    if (gpu_tiempos_intentado_) {
+      return;
+    }
+    gpu_tiempos_intentado_ = true;
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    UINT64 frecuencia = 0;
+    if (FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frecuencia)) || !frecuencia) {
+      REXGPU_WARN("[gpu] D3D12: sin frecuencia de timestamps");
+      return;
+    }
+    gpu_tiempos_ns_por_tick_ = 1e9 / double(frecuencia);
+    const uint32_t total = gpu_tiempos::kMarcasPorCuadro * kQueueFrames;
+    D3D12_QUERY_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap_desc.Count = total;
+    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_tiempos_heap_)))) {
+      REXGPU_WARN("[gpu] D3D12: no se pudo crear el heap de timestamps");
+      gpu_tiempos_heap_.Reset();
+      return;
+    }
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * total,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, sizeof(uint64_t) * total};
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&gpu_tiempos_readback_))) ||
+        FAILED(gpu_tiempos_readback_->Map(0, &read_range, &mapping))) {
+      REXGPU_WARN("[gpu] D3D12: no se pudo crear el bufer de lectura de timestamps");
+      gpu_tiempos_readback_.Reset();
+      gpu_tiempos_heap_.Reset();
+      return;
+    }
+    gpu_tiempos_map_ = reinterpret_cast<const uint64_t*>(mapping);
+    REXGPU_INFO("[gpu] D3D12: timestamps activos ({:.3f} ns por tick)", gpu_tiempos_ns_por_tick_);
+    for (auto& c : gpu_tiempos_cuadros_) {
+      c.n = 0;
+    }
+  }
+  if (cuadro.Completo()) {
+    gpu_tiempos_acum_.Procesar(gpu_tiempos_map_ + slot * gpu_tiempos::kMarcasPorCuadro, cuadro,
+                               gpu_tiempos_ns_por_tick_);
+  }
+  gpu_tiempos_acum_.TalvezLog("D3D12");
+  cuadro.n = 0;
+  GpuMarca(gpu_tiempos::kInicio);
+}
+
+void D3D12CommandProcessor::GpuMarca(gpu_tiempos::Marca marca) {
+  if (!gpu_tiempos_heap_ || !gpu_tiempos_map_ || !submission_open_ || !frame_open_) {
+    return;
+  }
+  const uint32_t slot = uint32_t(frame_current_ % kQueueFrames);
+  gpu_tiempos::Cuadro& cuadro = gpu_tiempos_cuadros_[slot];
+  if (!cuadro.Cabe(marca)) {
+    return;
+  }
+  const uint32_t base = slot * gpu_tiempos::kMarcasPorCuadro;
+  deferred_command_list_.D3DEndQuery(gpu_tiempos_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                     base + cuadro.n);
+  cuadro.tipo[cuadro.n++] = marca;
+  if (marca == gpu_tiempos::kFin) {
+    deferred_command_list_.D3DResolveQueryData(gpu_tiempos_heap_.Get(),
+                                               D3D12_QUERY_TYPE_TIMESTAMP, base, cuadro.n,
+                                               gpu_tiempos_readback_.Get(),
+                                               sizeof(uint64_t) * base);
+  }
 }
 
 void D3D12CommandProcessor::ReadbackStatsFrameEnd() {
@@ -3508,6 +3601,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 
   if (is_opening_frame) {
     frame_open_ = true;
+    GpuTiemposInicioCuadro();
 
     // Reset bindings that depend on the data stored in the pools.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -3549,6 +3643,9 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+  if (is_swap) {
+    GpuMarca(gpu_tiempos::kFin);
+  }
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
   // Make sure there is a command allocator to write commands to.

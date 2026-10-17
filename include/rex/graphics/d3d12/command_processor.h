@@ -15,6 +15,8 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+
+#include <rex/graphics/util/gpu_tiempos.h>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -670,6 +672,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t stats_wait_ns_ = 0;
   uint32_t stats_waits_ = 0;
   uint64_t stats_throttle_ns_ = 0;  // esperando a que la GPU libere un cuadro
+  // gpu_tiempos.
+  void GpuTiemposInicioCuadro();
+  void GpuMarca(gpu_tiempos::Marca marca);
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_tiempos_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_tiempos_readback_;
+  const uint64_t* gpu_tiempos_map_ = nullptr;
+  double gpu_tiempos_ns_por_tick_ = 0;
+  bool gpu_tiempos_intentado_ = false;
+  std::array<gpu_tiempos::Cuadro, kQueueFrames> gpu_tiempos_cuadros_{};
+  gpu_tiempos::Acumulador gpu_tiempos_acum_;
   uint64_t stats_resolve_wait_ns_ = 0;
   uint32_t stats_resolve_waits_ = 0;
   uint32_t stats_frames_ = 0;

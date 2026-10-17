@@ -42,6 +42,11 @@ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// Ver include/rex/graphics/util/gpu_tiempos.h.
+REXCVAR_DEFINE_BOOL(gpu_tiempos, false, "GPU",
+                    "Cada 5 s escribe en el log el tiempo de GPU por cuadro (dibujos, resolves, swap)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 

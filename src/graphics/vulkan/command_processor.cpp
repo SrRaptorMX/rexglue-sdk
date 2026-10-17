@@ -1956,6 +1956,7 @@ void VulkanCommandProcessor::ShutdownContext() {
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, memexport_full_buffer_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, memexport_full_memory_);
   memexport_full_size_ = 0;
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyQueryPool, device, gpu_tiempos_pool_);
 
   resolve_downscale_buffer_size_ = 0;
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_downscale_buffer_);
@@ -2288,6 +2289,73 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// gpu_tiempos: ver include/rex/graphics/util/gpu_tiempos.h. Un grupo de kMarcasPorCuadro
+// consultas por cada cuadro en vuelo; al reabrir un grupo, su cuadro anterior ya termino en la GPU.
+void VulkanCommandProcessor::GpuTiemposInicioCuadro() {
+  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
+  gpu_tiempos::Cuadro& cuadro = gpu_tiempos_cuadros_[slot];
+  if (!REXCVAR_GET(gpu_tiempos)) {
+    cuadro.n = 0;
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (gpu_tiempos_pool_ == VK_NULL_HANDLE) {
+    if (gpu_tiempos_intentado_) {
+      return;
+    }
+    gpu_tiempos_intentado_ = true;
+    VkPhysicalDeviceProperties props = {};
+    vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+        vulkan_device->physical_device(), &props);
+    gpu_tiempos_ns_por_tick_ = double(props.limits.timestampPeriod);
+    VkQueryPoolCreateInfo pool_info = {};
+    pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    pool_info.queryCount = gpu_tiempos::kMarcasPorCuadro * kMaxFramesInFlight;
+    if (gpu_tiempos_ns_por_tick_ <= 0 ||
+        dfn.vkCreateQueryPool(device, &pool_info, nullptr, &gpu_tiempos_pool_) != VK_SUCCESS) {
+      gpu_tiempos_pool_ = VK_NULL_HANDLE;
+      REXGPU_WARN("[gpu] Vulkan: no se pudo crear el pool de timestamps");
+      return;
+    }
+    REXGPU_INFO("[gpu] Vulkan: timestamps activos ({} ns por tick)", gpu_tiempos_ns_por_tick_);
+    for (auto& c : gpu_tiempos_cuadros_) {
+      c.n = 0;
+    }
+  }
+  if (cuadro.Completo()) {
+    uint64_t ts[gpu_tiempos::kMarcasPorCuadro];
+    if (dfn.vkGetQueryPoolResults(device, gpu_tiempos_pool_, slot * gpu_tiempos::kMarcasPorCuadro,
+                                  cuadro.n, sizeof(uint64_t) * cuadro.n, ts, sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+      gpu_tiempos_acum_.Procesar(ts, cuadro, gpu_tiempos_ns_por_tick_);
+    }
+  }
+  gpu_tiempos_acum_.TalvezLog("Vulkan");
+  cuadro.n = 0;
+  EndRenderPass();
+  deferred_command_buffer_.CmdVkResetQueryPool(
+      gpu_tiempos_pool_, slot * gpu_tiempos::kMarcasPorCuadro, gpu_tiempos::kMarcasPorCuadro);
+  GpuMarca(gpu_tiempos::kInicio);
+}
+
+void VulkanCommandProcessor::GpuMarca(gpu_tiempos::Marca marca) {
+  if (gpu_tiempos_pool_ == VK_NULL_HANDLE || !submission_open_ || !frame_open_) {
+    return;
+  }
+  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
+  gpu_tiempos::Cuadro& cuadro = gpu_tiempos_cuadros_[slot];
+  if (!cuadro.Cabe(marca)) {
+    return;
+  }
+  deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                               gpu_tiempos_pool_,
+                                               slot * gpu_tiempos::kMarcasPorCuadro + cuadro.n);
+  cuadro.tipo[cuadro.n++] = marca;
+}
+
 // Resumen de rendimiento cada 5 s con readback_resolve_stats=true. Mismo formato base
 // que la linea [readback] de D3D12, mas el desglose de en que espera el CPU a la GPU:
 // - "cuadros en vuelo": la GPU va atrasada (cuello de botella en la GPU).
@@ -2351,6 +2419,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
     REXGPU_ERROR("XELOG_GPU PRESENT: BeginSubmission FAILED");
     return;
   }
+  GpuMarca(gpu_tiempos::kSwapIni);
 
   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
@@ -4469,13 +4538,17 @@ bool VulkanCommandProcessor::IssueCopy() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
+  GpuMarca(gpu_tiempos::kResolveIni);
+  bool resolve_ok;
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    resolve_ok = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                               written_address, written_length);
+  } else {
+    resolve_ok = IssueCopy_ReadbackResolvePath();
   }
-
-  return IssueCopy_ReadbackResolvePath();
+  GpuMarca(gpu_tiempos::kResolveFin);
+  return resolve_ok;
 }
 
 bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
@@ -5260,6 +5333,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   if (is_opening_frame) {
     frame_open_ = true;
     frame_used_async_placeholder_pipeline_ = false;
+    GpuTiemposInicioCuadro();
 
     // Reset bindings that depend on transient data.
     std::memset(current_float_constant_map_vertex_, 0, sizeof(current_float_constant_map_vertex_));
@@ -5325,6 +5399,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
 }
 
 bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+  if (is_swap) {
+    GpuMarca(gpu_tiempos::kFin);
+  }
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();

@@ -28,6 +28,7 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/util/gpu_tiempos.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
@@ -427,6 +428,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   }
   // readback_resolve_stats en Vulkan: resumen de esperas CPU-GPU cada 5 s.
   void RendStatsFrameEnd();
+  // gpu_tiempos: marcas de tiempo de GPU por cuadro.
+  void GpuTiemposInicioCuadro();
+  void GpuMarca(gpu_tiempos::Marca marca);
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
@@ -779,6 +783,12 @@ class VulkanCommandProcessor : public CommandProcessor {
   double stats_worst_frame_ms_ = 0;
   std::chrono::steady_clock::time_point stats_t0_{};
   std::chrono::steady_clock::time_point stats_prev_frame_{};
+  // gpu_tiempos.
+  VkQueryPool gpu_tiempos_pool_ = VK_NULL_HANDLE;
+  double gpu_tiempos_ns_por_tick_ = 0;
+  bool gpu_tiempos_intentado_ = false;
+  std::array<gpu_tiempos::Cuadro, kMaxFramesInFlight> gpu_tiempos_cuadros_{};
+  gpu_tiempos::Acumulador gpu_tiempos_acum_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

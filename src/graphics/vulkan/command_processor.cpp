@@ -46,6 +46,8 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, readback_resolve_stats);
+
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
@@ -2286,8 +2288,52 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+// Resumen de rendimiento cada 5 s con readback_resolve_stats=true. Mismo formato base
+// que la linea [readback] de D3D12, mas el desglose de en que espera el CPU a la GPU:
+// - "cuadros en vuelo": la GPU va atrasada (cuello de botella en la GPU).
+// - "oclusion" / "memexport": esperas completas forzadas por consultas o lecturas al CPU.
+void VulkanCommandProcessor::RendStatsFrameEnd() {
+  const auto now = std::chrono::steady_clock::now();
+  if (!REXCVAR_GET(readback_resolve_stats)) {
+    stats_frames_ = 0;
+    return;
+  }
+  if (stats_frames_ == 0) {
+    stats_t0_ = now;
+    stats_prev_frame_ = now;
+    stats_fence_wait_ns_ = stats_wait_ns_ = stats_throttle_ns_ = 0;
+    stats_occlusion_ns_ = stats_memexport_ns_ = 0;
+    stats_waits_ = stats_throttles_ = stats_occlusions_ = 0;
+    stats_memexport_full_ = stats_memexport_fast_ = stats_submissions_ = 0;
+    stats_worst_frame_ms_ = 0;
+    stats_frames_ = 1;
+    return;
+  }
+  stats_worst_frame_ms_ = std::max(
+      stats_worst_frame_ms_, std::chrono::duration<double, std::milli>(now - stats_prev_frame_).count());
+  stats_prev_frame_ = now;
+  ++stats_frames_;
+  const double elapsed = std::chrono::duration<double>(now - stats_t0_).count();
+  if (elapsed < 5.0) {
+    return;
+  }
+  const double frames = double(stats_frames_ - 1);
+  REXGPU_INFO(
+      "[readback] Vulkan {:.1f} cuadros/s (peor {:.1f} ms) | CPU esperando a la GPU: {:.2f} "
+      "ms/cuadro | cuadros en vuelo: {:.2f} ms/cuadro ({}) | esperas completas: {:.2f} "
+      "ms/cuadro ({:.1f}/cuadro) | oclusion: {:.2f} ms/cuadro ({:.1f}/cuadro) | memexport: "
+      "{:.2f} ms/cuadro (completas {:.1f}/cuadro, rapidas {:.1f}/cuadro) | envios {:.1f}/cuadro",
+      frames / elapsed, stats_worst_frame_ms_, stats_fence_wait_ns_ / 1e6 / frames,
+      stats_throttle_ns_ / 1e6 / frames, stats_throttles_, stats_wait_ns_ / 1e6 / frames,
+      stats_waits_ / frames, stats_occlusion_ns_ / 1e6 / frames, stats_occlusions_ / frames,
+      stats_memexport_ns_ / 1e6 / frames, stats_memexport_full_ / frames,
+      stats_memexport_fast_ / frames, stats_submissions_ / frames);
+  stats_frames_ = 0;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
+  RendStatsFrameEnd();
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -4191,11 +4237,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       memexport_total_size += memexport_range.size_bytes;
     }
     if (memexport_total_size) {
+      const uint64_t antes = stats_wait_ns_;
       if (REXCVAR_GET(readback_memexport_fast)) {
         IssueDraw_MemexportReadbackFastPath(memexport_total_size);
       } else {
         IssueDraw_MemexportReadbackFullPath(memexport_total_size);
       }
+      stats_memexport_ns_ += stats_wait_ns_ - antes;
     }
   }
 
@@ -4206,6 +4254,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_
   if (!total_size || memexport_ranges_.empty()) {
     return true;
   }
+  ++stats_memexport_full_;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -4397,6 +4446,7 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   readback_memory_range.size = VK_WHOLE_SIZE;
   dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
 
+  ++stats_memexport_fast_;
   const uint8_t* readback_bytes =
       reinterpret_cast<const uint8_t*>(readback.mapped_data[read_index]);
   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
@@ -4914,8 +4964,14 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
   if (!EndSubmission(false)) {
     return false;
   }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
+  {
+    const uint64_t antes = stats_wait_ns_;
+    const bool ok = AwaitAllQueueOperationsCompletion();
+    stats_occlusion_ns_ += stats_wait_ns_ - antes;
+    ++stats_occlusions_;
+    if (!ok) {
+      return false;
+    }
   }
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
@@ -4998,9 +5054,13 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
+    const auto espera_t0 = std::chrono::steady_clock::now();
     VkResult wait_result =
         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    stats_fence_wait_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - espera_t0)
+                                         .count());
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5139,7 +5199,14 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // is still available, and whether the await was successful.
   uint64_t await_submission =
       is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
-  CheckSubmissionFenceAndDeviceLoss(await_submission);
+  {
+    const uint64_t antes = stats_fence_wait_ns_;
+    CheckSubmissionFenceAndDeviceLoss(await_submission);
+    if (stats_fence_wait_ns_ != antes) {
+      stats_throttle_ns_ += stats_fence_wait_ns_ - antes;
+      ++stats_throttles_;
+    }
+  }
   if (device_lost_ || submission_completed_ < await_submission) {
     return false;
   }
@@ -5468,6 +5535,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Increments the current submission number, going to the next submission.
     submissions_in_flight_fences_.push_back(fence);
     fences_free_.pop_back();
+    ++stats_submissions_;
 
     submission_open_ = false;
   }

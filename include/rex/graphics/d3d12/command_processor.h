@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -326,7 +327,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
+    // se mide cuanto espera el CPU a la GPU (readback_resolve_stats).
+    const auto t0 = std::chrono::steady_clock::now();
     CheckSubmissionFence(submission_current_);
+    stats_wait_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0)
+                                   .count());
+    ++stats_waits_;
     return submission_completed_ + 1 >= submission_current_;
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
@@ -366,6 +373,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
+  // Modo de lectura de un resolve segun readback_resolve_full_ranges.
+  ReadbackResolveMode ReadbackResolveModeFor(ReadbackResolveMode base, uint32_t address);
+  void ReadbackStatsFrameEnd();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 
@@ -647,6 +657,26 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  // Lectura selectiva de resolves y estadisticas.
+  struct ReadbackResolveStat {
+    uint32_t count = 0;
+    uint64_t wait_ns = 0;
+    uint32_t format = 0;
+    bool scaled = false;
+    ReadbackResolveMode mode = ReadbackResolveMode::kDisabled;
+  };
+  std::unordered_map<uint64_t, ReadbackResolveStat> readback_stats_;
+  uint64_t stats_wait_ns_ = 0;
+  uint32_t stats_waits_ = 0;
+  uint64_t stats_throttle_ns_ = 0;  // esperando a que la GPU libere un cuadro
+  uint64_t stats_resolve_wait_ns_ = 0;
+  uint32_t stats_resolve_waits_ = 0;
+  uint32_t stats_frames_ = 0;
+  std::chrono::steady_clock::time_point stats_t0_{};
+  std::string readback_full_ranges_spec_;
+  bool readback_full_ranges_parsed_ = false;
+  std::vector<std::pair<uint32_t, uint32_t>> readback_full_ranges_;  // [inicio, fin)
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;

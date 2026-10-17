@@ -14,6 +14,7 @@
 #include <cstring>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -46,6 +47,22 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Lectura selectiva de resolves. Con readback_resolve=full cada resolve leido obliga al
+// CPU a esperar a que la GPU termine TODO lo pendiente (CPU y GPU dejan de trabajar en paralelo).
+REXCVAR_DEFINE_BOOL(readback_resolve_stats, false, "GPU",
+                    "Cada 5 s escribe en el log que resolves se leen al CPU y cuanto espera el "
+                    "CPU a la GPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(readback_resolve_full_ranges, "", "GPU",
+                      "Con readback_resolve=full solo se leen de inmediato los resolves cuya "
+                      "direccion fisica esta en estos rangos hex (\"1A000000-1A400000,1C2E0000\"); "
+                      "vacio = todos")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(readback_resolve_others, "fast", "GPU",
+                      "Modo de los resolves fuera de readback_resolve_full_ranges: none, fast, some")
+    .allowed({"none", "fast", "some"})
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::d3d12 {
@@ -2887,6 +2904,132 @@ bool D3D12CommandProcessor::IssueCopy() {
   return IssueCopy_ReadbackResolvePath();
 }
 
+namespace {
+const char* ReadbackModeName(ReadbackResolveMode m) {
+  switch (m) {
+    case ReadbackResolveMode::kFast:
+      return "fast";
+    case ReadbackResolveMode::kSome:
+      return "some";
+    case ReadbackResolveMode::kFull:
+      return "full";
+    default:
+      return "none";
+  }
+}
+bool ParseHex32(std::string s, uint32_t& out) {
+  while (!s.empty() && (s.front() == ' ' || s.front() == '\t')) s.erase(s.begin());
+  while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+  if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s = s.substr(2);
+  if (s.empty() || s.size() > 8) return false;
+  uint32_t v = 0;
+  for (char ch : s) {
+    v <<= 4;
+    if (ch >= '0' && ch <= '9') v |= uint32_t(ch - '0');
+    else if (ch >= 'a' && ch <= 'f') v |= uint32_t(ch - 'a' + 10);
+    else if (ch >= 'A' && ch <= 'F') v |= uint32_t(ch - 'A' + 10);
+    else return false;
+  }
+  out = v;
+  return true;
+}
+}  // namespace
+
+ReadbackResolveMode D3D12CommandProcessor::ReadbackResolveModeFor(ReadbackResolveMode base,
+                                                                  uint32_t address) {
+  if (base != ReadbackResolveMode::kFull) {
+    return base;
+  }
+  const std::string spec = REXCVAR_GET(readback_resolve_full_ranges);
+  if (!readback_full_ranges_parsed_ || spec != readback_full_ranges_spec_) {
+    readback_full_ranges_parsed_ = true;
+    readback_full_ranges_spec_ = spec;
+    readback_full_ranges_.clear();
+    size_t pos = 0;
+    while (pos <= spec.size()) {
+      size_t end = spec.find(',', pos);
+      if (end == std::string::npos) end = spec.size();
+      std::string tok = spec.substr(pos, end - pos);
+      pos = end + 1;
+      if (tok.find_first_not_of(" \t") == std::string::npos) continue;
+      uint32_t lo = 0, hi = 0;
+      const size_t dash = tok.find('-');
+      bool ok = dash == std::string::npos
+                    ? (ParseHex32(tok, lo) && ((hi = lo + 1), true))
+                    : (ParseHex32(tok.substr(0, dash), lo) && ParseHex32(tok.substr(dash + 1), hi));
+      if (ok && hi > lo) {
+        readback_full_ranges_.emplace_back(lo, hi);
+      } else {
+        REXGPU_ERROR("readback_resolve_full_ranges: rango no valido '{}'", tok);
+      }
+    }
+    if (!spec.empty()) {
+      REXGPU_INFO("[readback] lectura inmediata solo en {} rango(s); el resto usa '{}'",
+                  readback_full_ranges_.size(), REXCVAR_GET(readback_resolve_others));
+    }
+  }
+  if (spec.empty()) {
+    return base;
+  }
+  for (const auto& r : readback_full_ranges_) {
+    if (address >= r.first && address < r.second) {
+      return ReadbackResolveMode::kFull;
+    }
+  }
+  const std::string others = REXCVAR_GET(readback_resolve_others);
+  if (others == "fast") return ReadbackResolveMode::kFast;
+  if (others == "some") return ReadbackResolveMode::kSome;
+  return ReadbackResolveMode::kDisabled;
+}
+
+void D3D12CommandProcessor::ReadbackStatsFrameEnd() {
+  if (!REXCVAR_GET(readback_resolve_stats)) {
+    stats_frames_ = 0;
+    if (!readback_stats_.empty()) readback_stats_.clear();
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (stats_frames_ == 0) {
+    stats_t0_ = now;
+    stats_wait_ns_ = 0;
+    stats_waits_ = 0;
+    stats_throttle_ns_ = 0;
+    stats_resolve_wait_ns_ = 0;
+    stats_resolve_waits_ = 0;
+    readback_stats_.clear();
+    stats_frames_ = 1;
+    return;
+  }
+  ++stats_frames_;
+  const double elapsed = std::chrono::duration<double>(now - stats_t0_).count();
+  if (elapsed < 5.0) {
+    return;
+  }
+  const double frames = double(stats_frames_ - 1);
+  REXGPU_INFO(
+      "[readback] {:.1f} cuadros/s | cuadros en vuelo: {:.2f} ms/cuadro | CPU esperando a la "
+      "GPU: {:.2f} ms/cuadro ({} esperas) | "
+      "de eso por resolves: {:.2f} ms/cuadro ({} esperas) | {} resolves distintos",
+      frames / elapsed, stats_throttle_ns_ / 1e6 / frames, stats_wait_ns_ / 1e6 / frames,
+      stats_waits_,
+      stats_resolve_wait_ns_ / 1e6 / frames, stats_resolve_waits_, readback_stats_.size());
+  std::vector<std::pair<uint64_t, ReadbackResolveStat>> v(readback_stats_.begin(),
+                                                          readback_stats_.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) {
+    return a.second.wait_ns != b.second.wait_ns ? a.second.wait_ns > b.second.wait_ns
+                                                : a.second.count > b.second.count;
+  });
+  for (size_t i = 0; i < v.size() && i < 16; ++i) {
+    const auto& s = v[i].second;
+    REXGPU_INFO(
+        "[readback]   dir={:08X} tam={:8} fmt={:2} escalado={} modo={:4} veces/cuadro={:5.2f} "
+        "espera={:.2f} ms/cuadro",
+        uint32_t(v[i].first >> 32), uint32_t(v[i].first), s.format, s.scaled ? 1 : 0,
+        ReadbackModeName(s.mode), s.count / frames, s.wait_ns / 1e6 / frames);
+  }
+  stats_frames_ = 0;  // el siguiente cuadro reinicia contadores
+}
+
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
   if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_, written_address,
@@ -2899,6 +3042,21 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
+    return true;
+  }
+
+  ReadbackResolveMode readback_mode = ReadbackResolveModeFor(
+      GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve)), written_address);
+  ReadbackResolveStat* stat = nullptr;
+  if (REXCVAR_GET(readback_resolve_stats)) {
+    stat = &readback_stats_[MakeReadbackResolveKey(written_address, written_length)];
+    ++stat->count;
+    stat->mode = readback_mode;
+    stat->scaled = texture_cache_->IsDrawResolutionScaled();
+    stat->format =
+        uint32_t(register_file_->Get<reg::RB_COPY_DEST_INFO>().copy_dest_format);
+  }
+  if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
 
@@ -3070,13 +3228,23 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                written_address, written_length);
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  auto await_resolve = [&]() {
+    const uint64_t before = stats_wait_ns_;
+    const bool ok = AwaitAllQueueOperationsCompletion();
+    const uint64_t waited = stats_wait_ns_ - before;
+    stats_resolve_wait_ns_ += waited;
+    ++stats_resolve_waits_;
+    if (stat) {
+      stat->wait_ns += waited;
+    }
+    return ok;
+  };
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
-  } else if (!AwaitAllQueueOperationsCompletion()) {
+  } else if (!await_resolve()) {
     return true;
   }
 
@@ -3085,7 +3253,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                            !rb.mapped_data[read_index])) {
     is_cache_miss = true;
     read_index = write_index;
-    if (!AwaitAllQueueOperationsCompletion()) {
+    if (!await_resolve()) {
       return true;
     }
   }
@@ -3278,8 +3446,16 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
+  {
+    const auto espera_t0 = std::chrono::steady_clock::now();
+    CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
+                                          : 0);
+    if (is_opening_frame) {
+      stats_throttle_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - espera_t0)
+                                         .count());
+    }
+  }
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -3459,6 +3635,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+    ReadbackStatsFrameEnd();
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

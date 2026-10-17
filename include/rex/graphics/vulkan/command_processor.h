@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <chrono>
 #include <climits>
 #include <cstdint>
 #include <deque>
@@ -417,9 +418,15 @@ class VulkanCommandProcessor : public CommandProcessor {
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
   bool AwaitAllQueueOperationsCompletion() {
+    // se cuenta cada espera completa (CPU parado hasta que la GPU termina todo).
+    const uint64_t antes = stats_fence_wait_ns_;
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
+    stats_wait_ns_ += stats_fence_wait_ns_ - antes;
+    ++stats_waits_;
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
+  // readback_resolve_stats en Vulkan: resumen de esperas CPU-GPU cada 5 s.
+  void RendStatsFrameEnd();
   // Keep primary-buffer-end submit behavior aligned with D3D12: only submit
   // when immediate submission is safe.
   bool CanEndSubmissionImmediately() const;
@@ -756,6 +763,22 @@ class VulkanCommandProcessor : public CommandProcessor {
   void* memexport_full_mapping_ = nullptr;
   VkDeviceSize memexport_full_size_ = 0;
   uint32_t memexport_full_memory_type_ = UINT32_MAX;
+  // Estadisticas de rendimiento (readback_resolve_stats).
+  uint64_t stats_fence_wait_ns_ = 0;    // todo el tiempo bloqueado en vkWaitForFences
+  uint64_t stats_wait_ns_ = 0;          // de eso, en esperas completas
+  uint32_t stats_waits_ = 0;
+  uint64_t stats_throttle_ns_ = 0;      // de eso, esperando a que la GPU libere un cuadro
+  uint32_t stats_throttles_ = 0;
+  uint64_t stats_occlusion_ns_ = 0;
+  uint32_t stats_occlusions_ = 0;
+  uint64_t stats_memexport_ns_ = 0;
+  uint32_t stats_memexport_full_ = 0;
+  uint32_t stats_memexport_fast_ = 0;
+  uint32_t stats_submissions_ = 0;
+  uint32_t stats_frames_ = 0;
+  double stats_worst_frame_ms_ = 0;
+  std::chrono::steady_clock::time_point stats_t0_{};
+  std::chrono::steady_clock::time_point stats_prev_frame_{};
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

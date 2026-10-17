@@ -1402,6 +1402,25 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       depth = SpirvShaderTranslator::Depth20e4To32(*builder_, depth_float24, 0, true, false,
                                                    ext_inst_glsl_std_450_);
       builder_->createStore(depth, output_fragment_depth_);
+    } else if (current_shader().writes_depth()) {
+      // Sin conversion float24 en el shader, la profundidad escrita por el shader (oDepth)
+      // queda en el rango del invitado [0, 1], pero con un buffer float24 el host usa [0, 0.5]
+      // (el viewport se escala por 0.5 para poder ida y vuelta en las copias de EDRAM, y el
+      // viewport no se aplica a oDepth). D3D12 multiplica por 0.5 en este caso
+      // (dxbc_translator_om.cpp); aqui faltaba, y lo que escribia oDepth quedaba al doble de
+      // profundidad (pelo detras de la cabeza en FIFA 07).
+      spv::Id depth = builder_->createLoad(output_fragment_depth_, spv::NoPrecision);
+      spv::Id is_float24 = builder_->createBinOp(
+          spv::OpINotEqual, type_bool_,
+          builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, main_system_constant_flags_,
+                                builder_->makeUintConstant(kSysFlag_DepthFloat24)),
+          const_uint_0_);
+      depth = builder_->createTriOp(
+          spv::OpSelect, type_float_, is_float24,
+          builder_->createNoContractionBinOp(spv::OpFMul, type_float_, depth,
+                                             builder_->makeFloatConstant(0.5f)),
+          depth);
+      builder_->createStore(depth, output_fragment_depth_);
     }
   }
 

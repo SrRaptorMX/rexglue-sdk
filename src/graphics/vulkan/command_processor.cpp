@@ -55,6 +55,16 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(vulkan_allow_reverse_z, true, "GPU/Vulkan",
+                    "Pasa al driver los viewports con rango de profundidad invertido (true, Xenia); "
+                    "false = enderezarlos en el shader como D3D12")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(vulkan_depth_bias_integer, true, "GPU/Vulkan",
+                    "Depth bias constante entero y redondeado hacia arriba como en D3D12 "
+                    "(false = valor fraccionario original de Xenia)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "When async shader compilation is enabled, skip presenting frames that "
                     "used placeholder pipelines to avoid visible flashing")
@@ -3927,7 +3937,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
   // directly to pixel address and to things like ps_param_gen.
   draw_util::GetHostViewportInfo(
       regs, draw_resolution_scale_x, draw_resolution_scale_y, false,
-      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1], true,
+      device_properties.maxViewportDimensions[0], device_properties.maxViewportDimensions[1],
+      REXCVAR_GET(vulkan_allow_reverse_z),
       normalized_depth_control,
       host_render_targets_used && render_target_cache_->depth_float24_convert_in_pixel_shader(),
       host_render_targets_used, pixel_shader && pixel_shader->writes_depth(), viewport_info);
@@ -5708,10 +5719,17 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
     float depth_bias_constant_factor, depth_bias_slope_factor;
     draw_util::GetPreferredFacePolygonOffset(regs, primitive_polygonal, depth_bias_slope_factor,
                                              depth_bias_constant_factor);
-    depth_bias_constant_factor *=
-        regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
-            ? draw_util::kD3D10PolygonOffsetFactorUnorm24
-            : draw_util::kD3D10PolygonOffsetFactorFloat24;
+    if (REXCVAR_GET(vulkan_depth_bias_integer)) {
+      // Igual que D3D12: bias constante entero, redondeado hacia arriba (y en multiplos de
+      // 8 para float24), para que un desplazamiento pequeno nunca se vuelva 0 (pelo sobre la cabeza).
+      depth_bias_constant_factor = float(draw_util::GetD3D10IntegerPolygonOffset(
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format, depth_bias_constant_factor));
+    } else {
+      depth_bias_constant_factor *=
+          regs.Get<reg::RB_DEPTH_INFO>().depth_format == xenos::DepthRenderTargetFormat::kD24S8
+              ? draw_util::kD3D10PolygonOffsetFactorUnorm24
+              : draw_util::kD3D10PolygonOffsetFactorFloat24;
+    }
     // With non-square resolution scaling, make sure the worst-case impact is
     // reverted (slope only along the scaled axis), thus max. More bias is
     // better than less bias, because less bias means Z fighting with the

@@ -3704,6 +3704,13 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
           }
         } break;
       }
+    } else if (mode.output == TransferOutput::kStencilBit && source_stencil[0] != spv::NoResult) {
+      // Profundidad -> bit de stencil (sin VK_EXT_shader_stencil_export, p. ej. NVIDIA):
+      // en este modo solo se enlaza la textura de stencil de origen (no la de profundidad), asi que
+      // source_depth_float[0] no existe. Antes no se calculaba `packed`, el shader nunca descartaba
+      // y los 8 pasos escribian todos los bits: el stencil copiado quedaba en 0xFF (HUD sin
+      // recortar). D3D12 usa aqui kStencilToStencilBit, que solo lee el stencil.
+      packed = source_stencil[0];
     } else if (source_depth_float[0] != spv::NoResult) {
       if (mode.output == TransferOutput::kDepth && dest_depth_format == source_depth_format) {
         builder.createStore(source_depth_float[0], output_fragment_depth);
@@ -4025,9 +4032,14 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_width_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k4X)),
+                                        // Era key.source_msaa_samples: el origen de la
+                                        // profundidad del host puede tener otro MSAA que el
+                                        // origen invitado (D3D12 usa
+                                        // host_depth_source_msaa_samples aqui).
+                                        builder.makeUintConstant(
+                                            tile_width_samples >>
+                                            uint32_t(key.host_depth_source_msaa_samples >=
+                                                     xenos::MsaaSamples::k4X)),
                                         host_depth_source_tile_index_x),
                     host_depth_source_tile_pixel_x));
             spv::Id host_depth_source_pixel_y_int = builder.createUnaryOp(
@@ -4035,9 +4047,10 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_height_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k2X)),
+                                        builder.makeUintConstant(
+                                            tile_height_samples >>
+                                            uint32_t(key.host_depth_source_msaa_samples >=
+                                                     xenos::MsaaSamples::k2X)),
                                         host_depth_source_tile_index_y),
                     host_depth_source_tile_pixel_y));
             // Load the host depth source.

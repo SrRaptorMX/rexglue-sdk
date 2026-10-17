@@ -17,6 +17,10 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
                     "Allow invalid fetch constants");
 REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
 REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
+REXCVAR_DEFINE_DOUBLE(rtv_unorm8_round_bias, 0.0, "GPU",
+                      "RT host: multiplica por (1 + valor) el color escrito en render targets de 8 bits "
+                      "por canal para redondear los empates hacia arriba como el Xbox 360 (0 = no). "
+                      "D3D12 (RTV) y Vulkan (FBO)");
 REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
                     "Convert float24 depth in pixel shader");
 REXCVAR_DEFINE_BOOL(depth_transfer_not_equal_test, true, "GPU",

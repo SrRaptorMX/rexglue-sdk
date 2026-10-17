@@ -34,6 +34,7 @@
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+// rtv_unorm8_round_bias: definida en graphics/flags.cpp (compartida con Vulkan).
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
@@ -3886,6 +3887,12 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     }
     auto color_exp_bias_scale =
         rex::memory::Reinterpret<float>(int32_t(0x3F800000 + (color_exp_bias << 23)));
+    // rtv_unorm8_round_bias: empates hacia arriba en render targets de 8 bits (camino RTV).
+    if ((color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+         color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) &&
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+      color_exp_bias_scale *= float(1.0 + REXCVAR_GET(rtv_unorm8_round_bias));
+    }
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_rov_used) {

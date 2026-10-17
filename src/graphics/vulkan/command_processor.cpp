@@ -6245,6 +6245,13 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
     float color_exp_bias_scale;
     *reinterpret_cast<int32_t*>(&color_exp_bias_scale) =
         UINT32_C(0x3F800000) + (color_exp_bias << 23);
+    // rtv_unorm8_round_bias: empates hacia arriba en render targets de 8 bits (camino FBO),
+    // igual que en D3D12 (camino RTV). En FSI el empaquetado ya se hace en el shader.
+    if ((color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+         color_info.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) &&
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+      color_exp_bias_scale *= float(1.0 + REXCVAR_GET(rtv_unorm8_round_bias));
+    }
     dirty |= system_constants_.color_exp_bias[i] != color_exp_bias_scale;
     system_constants_.color_exp_bias[i] = color_exp_bias_scale;
     if (edram_fragment_shader_interlock) {

@@ -34,6 +34,7 @@ REXCVAR_DECLARE(int32_t, query_occlusion_fake_sample_count);
 
 // GPU Depth / Render Target Behavior
 REXCVAR_DECLARE(bool, depth_float24_round);
+REXCVAR_DECLARE(double, rtv_unorm8_round_bias);
 REXCVAR_DECLARE(bool, depth_float24_convert_in_pixel_shader);
 REXCVAR_DECLARE(bool, depth_transfer_not_equal_test);
 REXCVAR_DECLARE(bool, native_stencil_value_output);

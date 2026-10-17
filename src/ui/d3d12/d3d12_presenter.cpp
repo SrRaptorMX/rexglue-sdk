@@ -30,6 +30,8 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
+REXCVAR_DECLARE(bool, present_vsync);
+
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
@@ -1155,9 +1157,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  // present_vsync: intervalo 1 (espera al refresco del monitor, sin tearing; con G-Sync/FreeSync
+  // sigue funcionando el refresco variable por debajo de la frecuencia maxima).
+  const bool vsync_real = REXCVAR_GET(present_vsync);
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+      vsync_real ? 1 : 0,
+      vsync_real ? 0
+                    : (DXGI_PRESENT_RESTART |
+                       (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0)));
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

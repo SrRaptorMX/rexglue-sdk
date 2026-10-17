@@ -46,6 +46,8 @@
 #include <rex/ui/surface_mac.h>
 #endif
 
+REXCVAR_DECLARE(bool, present_vsync);
+
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
@@ -1381,7 +1383,10 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   // interfering with GPU command processing, and also to allow tearing so
   // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  if (REXCVAR_GET(present_vsync)) {
+    // V-Sync real (present_vsync): FIFO, sin tearing, siempre disponible.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate

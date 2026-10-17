@@ -29,6 +29,11 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
+// V-Sync real del host: D3D12 presenta con intervalo 1 sin tearing y
+// Vulkan usa FIFO. Sin esto se presenta con intervalo 0 y tearing permitido.
+REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/Presenter",
+                    "V-Sync real del host: espera al refresco del monitor (sin cortes en la imagen)");
+
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 

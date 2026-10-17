@@ -91,7 +91,13 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // Las constantes del sistema estan en el set kDescriptorSetConstants (1), binding
+  // kConstantBufferSystem; el set 0 es la memoria compartida. Con set = 0 el TCS leia basura como
+  // factores de teselado y Vulkan descartaba todos los parches (la red de la porteria).
+  source += fmt::format(
+      "layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+      uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+      uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -128,7 +134,8 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  // k8in16 (1) y k8in32 (2) intercambian bytes; k16in32 (3) solo medias palabras.
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {
@@ -162,7 +169,8 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  // k8in16 (1) y k8in32 (2) intercambian bytes; k16in32 (3) solo medias palabras.
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {

@@ -13,7 +13,9 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cstdint>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -88,6 +90,11 @@ class InputSystem : public system::IInputSystem {
   std::unique_ptr<DeviceAssignment> assignment_;
   ActiveDeviceTracker active_devices_;
 
+  // Protege el estado de dispositivos/usuarios: el juego llama a GetState/GetCapabilities
+  // desde varios hilos mientras RefreshDevices reconstruye devices_. Recursivo porque
+  // GetState, RemoveUIInputBlocker y ToggleVibration llaman a otras entradas publicas.
+  mutable std::recursive_mutex mutex_;
+
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
   // does not renumber pad two.
   std::vector<DeviceInfo> devices_;
@@ -102,6 +109,16 @@ class InputSystem : public system::IInputSystem {
   // Masked out per user until the guest sees them released.
   std::array<uint16_t, kMaxGuestUsers> consumed_buttons_ = {};
 };
+
+/// Kind of device that most recently produced real (non-neutral) input on any
+/// guest user. Lets a game swap its button glyphs between pad and keyboard.
+enum class LastInputKind : uint8_t { kNone = 0, kGamepad = 1, kKeyboardMouse = 2 };
+
+/// Updated by InputSystem::GetState; kNone until the first non-neutral input.
+LastInputKind GetLastInputKind();
+
+/// True while at least one physical (non-synthetic) pad is enumerated.
+bool HasPhysicalPad();
 
 /// Create a default InputSystem with SDL + MnK + NOP drivers.
 /// In tool mode, only the NOP driver is added.
